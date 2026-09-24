@@ -64,6 +64,35 @@ def _catalog(response: _FakeResponse) -> PublicCatalog:
     catalog._session = _FakeSession(response)
     return catalog
 
+_CATALOG_SHAPE = {
+    "id": "c1",
+    "name": "From Catalog",
+    "status": "ACTIVE",
+    "accountLinkURL": "https://example.invalid/link",
+    "startAt": "2026-09-20T00:00:00Z",
+    "endAt": "2026-10-20T00:00:00Z",
+    "game": {"id": "1", "displayName": "G", "name": "G", "slug": "g"},
+    "timeBasedDrops": [],
+    # what PublicCatalog normalises an absent channel list to
+    "allow": {"channels": None, "isEnabled": True},
+    "self": {"isAccountConnected": True},
+}
+
+# Same campaign as Twitch reports it: a participating-channel list, so the two
+# sources disagree on the type of allow.channels.
+_TWITCH_SHAPE = {
+    **_CATALOG_SHAPE,
+    "name": "From Twitch",
+    "allow": {"channels": [{"id": "9", "name": "chan", "displayName": "chan"}], "isEnabled": True},
+    "self": {"isAccountConnected": False},
+}
+
+
+def _record(campaign_id: str, **overrides: object) -> dict[str, object]:
+    """Build a mirror record that carries every key PublicCatalog validates."""
+    return {**_CATALOG_SHAPE, "id": campaign_id, **overrides}
+
+
 
 @requires_catalog
 @pytest.mark.asyncio
@@ -71,8 +100,8 @@ async def test_public_catalog_flattens_campaign_groups_in_order():
     catalog = _catalog(
         _FakeResponse(
             payload=[
-                {"gameDisplayName": "First Game", "rewards": [{"id": "first"}, {"id": "second"}]},
-                {"gameDisplayName": "Second Game", "rewards": [{"id": "third"}]},
+                {"gameDisplayName": "First Game", "rewards": [_record("first"), _record("second")]},
+                {"gameDisplayName": "Second Game", "rewards": [_record("third")]},
             ]
         )
     )
@@ -91,8 +120,8 @@ async def test_public_catalog_defaults_self_without_overwriting_existing_self():
             payload=[
                 {
                     "rewards": [
-                        {"id": "missing-self"},
-                        {"id": "existing-self", "self": existing_self},
+                        _record("missing-self"),
+                        _record("existing-self", self=existing_self),
                     ]
                 }
             ]
@@ -113,12 +142,12 @@ async def test_public_catalog_normalizes_allow_defaults_and_preserves_channels()
             payload=[
                 {
                     "rewards": [
-                        {"id": "missing-allow"},
-                        {"id": "missing-channels", "allow": {"isEnabled": False}},
-                        {
-                            "id": "existing-channels",
-                            "allow": {"channels": ["channel-a"], "isEnabled": False},
-                        },
+                        _record("missing-allow"),
+                        _record("missing-channels", allow={"isEnabled": False}),
+                        _record(
+                            "existing-channels",
+                            allow={"channels": ["channel-a"], "isEnabled": False},
+                        ),
                     ]
                 }
             ]
@@ -151,7 +180,7 @@ async def test_public_catalog_handles_invalid_payloads_and_skips_malformed_group
             payload=[
                 "not a group",
                 {"rewards": "not a list"},
-                {"rewards": ["not a reward", {"id": "valid"}]},
+                {"rewards": ["not a reward", _record("valid")]},
             ]
         )
     ).campaigns()
@@ -305,3 +334,114 @@ async def test_inventory_service_uses_catalog_for_missing_campaigns_and_empty_in
     inventory_service.fetch_campaigns.assert_awaited_once_with(
         [(catalog_inventory_campaign["id"], catalog_inventory_campaign)]
     )
+
+
+
+@requires_catalog
+def test_merge_campaign_data_survives_mixed_source_shape_clash():
+    """A fallback list and a Twitch detail can disagree in shape without crashing."""
+    only_catalog = {**_CATALOG_SHAPE, "id": "c2", "name": "Catalog Only"}
+
+    merged = InventoryService._merge_campaign_data(
+        {"c1": dict(_CATALOG_SHAPE), "c2": only_catalog},
+        {"c1": dict(_TWITCH_SHAPE)},
+    )
+
+    assert sorted(merged) == ["c1", "c2"]
+    # Twitch answered for c1, so its record wins outright.
+    assert merged["c1"]["name"] == "From Twitch"
+    # c2 was never answered for, so the catalog record is kept as-is.
+    assert merged["c2"]["name"] == "Catalog Only"
+
+
+@requires_catalog
+@pytest.mark.asyncio
+async def test_twitch_account_state_overrides_catalog_linkage_placeholder():
+    """The mirror cannot know linkage, so it must never beat Twitch's real answer."""
+    twitch = SimpleNamespace(
+        get_auth=AsyncMock(return_value=SimpleNamespace(user_id="123")),
+        gql_request=AsyncMock(
+            return_value=[{"data": {"user": {"dropCampaign": dict(_TWITCH_SHAPE)}}}]
+        ),
+    )
+    service = object.__new__(InventoryService)
+    service._twitch = twitch
+    service._catalog = None
+
+    result = await service.fetch_campaigns([("c1", dict(_CATALOG_SHAPE))])
+
+    assert result["c1"]["self"]["isAccountConnected"] is False
+
+
+@requires_catalog
+@pytest.mark.asyncio
+async def test_public_catalog_drops_records_the_campaign_model_cannot_index():
+    """Truncated records are dropped at the boundary rather than raising later."""
+    valid = {**_CATALOG_SHAPE, "id": "good-2"}
+    catalog = _catalog(
+        _FakeResponse(
+            payload=[
+                {
+                    "rewards": [
+                        {"name": "no id", "status": "ACTIVE"},
+                        {"id": "x", "name": "no status"},
+                        {"id": "", "name": "empty id", "status": "ACTIVE"},
+                        {**_CATALOG_SHAPE, "id": "y", "timeBasedDrops": None},
+                        valid,
+                    ]
+                }
+            ]
+        )
+    )
+
+    campaigns = await catalog.campaigns()
+
+    assert [campaign["id"] for campaign in campaigns] == ["good-2"]
+
+
+@requires_catalog
+@pytest.mark.asyncio
+async def test_available_campaign_filter_skips_records_without_id_or_status():
+    """A malformed campaign list entry must not abort the whole inventory fetch."""
+    inventory = {
+        "dropCampaignsInProgress": [],
+        "gameEventDrops": [],
+    }
+    twitch = SimpleNamespace(
+        gql_request=AsyncMock(
+            side_effect=[
+                {"data": {"currentUser": {"inventory": inventory}}},
+                {
+                    "data": {
+                        "currentUser": {
+                            "dropCampaigns": [
+                                {"name": "no id", "status": "ACTIVE"},
+                                {"id": "keep", "status": "ACTIVE", "game": {"id": "g"}},
+                                {"id": "expired", "status": "EXPIRED"},
+                            ]
+                        }
+                    }
+                },
+            ]
+        ),
+        gui=SimpleNamespace(
+            status=SimpleNamespace(update=MagicMock()),
+            inv=SimpleNamespace(clear=MagicMock(), add_campaign=AsyncMock()),
+        ),
+        _drops={},
+        _campaigns={},
+        inventory=[],
+        _mnt_triggers=[],
+        _mnt_task=None,
+        _state=State.IDLE,
+        _maintenance_service=SimpleNamespace(run_maintenance_task=AsyncMock()),
+    )
+    service = object.__new__(InventoryService)
+    service._twitch = twitch
+    service._catalog = None
+    service.fetch_campaigns = AsyncMock(return_value={})
+
+    await service.fetch_inventory()
+    await twitch._mnt_task
+
+    service.fetch_campaigns.assert_awaited_once_with([("keep", {"id": "keep", "status": "ACTIVE", "game": {"id": "g"}})])

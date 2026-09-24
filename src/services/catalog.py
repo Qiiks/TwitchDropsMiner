@@ -57,8 +57,13 @@ class PublicCatalog:
                 if not isinstance(rewards, list):
                     continue
                 for reward in rewards:
-                    if not isinstance(reward, dict):
+                    if not self._is_usable(reward):
                         continue
+                    # The mirror carries no per-account state, and the campaign
+                    # model requires this edge. Assuming a linked account is the
+                    # arrangement the operator opts into by configuring
+                    # TDM_CATALOG_URL; Twitch's own value replaces it whenever
+                    # Twitch answers for the campaign (see InventoryService).
                     reward.setdefault("self", {"isAccountConnected": True})
                     # The mirror omits `channels` on campaigns that have no
                     # participating-channel list; the campaign model indexes it
@@ -76,6 +81,41 @@ class PublicCatalog:
         except Exception as exc:
             logger.warning("Failed to fetch public campaign catalog: %s", exc)
             return []
+
+    @staticmethod
+    def _is_usable(reward: object) -> bool:
+        """Report whether a mirrored record carries what the campaign model indexes.
+
+        A record that fails this is dropped rather than propagated: the model
+        indexes these keys directly, so a truncated one would otherwise raise
+        (KeyError, or a parse error) in the caller, outside this module's own
+        error handling.
+        """
+        if not isinstance(reward, dict):
+            return False
+        if not isinstance(reward.get("id"), str) or not reward["id"]:
+            logger.warning("Skipping catalog record without a usable id: %r", reward.get("name"))
+            return False
+        required = {
+            "name": str,
+            "status": str,
+            "accountLinkURL": str,
+            "startAt": str,
+            "endAt": str,
+            "game": dict,
+            "timeBasedDrops": list,
+        }
+        for key, kind in required.items():
+            if not isinstance(reward.get(key), kind):
+                logger.warning(
+                    "Skipping catalog record %s: %s is %s, expected %s",
+                    reward["id"],
+                    key,
+                    type(reward.get(key)).__name__,
+                    kind.__name__,
+                )
+                return False
+        return True
 
     async def close(self) -> None:
         """Close the reusable HTTP session when one has been created."""

@@ -17,7 +17,7 @@ from dateutil.parser import isoparse
 
 from src.api import GQLClient
 from src.config import GQL_OPERATIONS
-from src.exceptions import ExitRequest
+from src.exceptions import ExitRequest, MinerException
 from src.i18n import _
 from src.models import DropsCampaign
 from src.services.catalog import PublicCatalog
@@ -115,13 +115,17 @@ class InventoryService:
             response_list_raw if isinstance(response_list_raw, list) else [response_list_raw]
         )
 
-        fetched_data: dict[str, JsonType] = {}
+        # Split the two sources: Twitch's own answer, and what the fallback
+        # catalog supplied for the ids Twitch left null.
+        twitch_data: dict[str, JsonType] = {}
         for response_json in response_list:
             data = response_json.get("data")
             user = data.get("user") if isinstance(data, dict) else None
             campaign_data = user.get("dropCampaign") if isinstance(user, dict) else None
             if campaign_data is not None:
-                fetched_data[campaign_data["id"]] = campaign_data
+                twitch_data[campaign_data["id"]] = campaign_data
+
+        fetched_data: dict[str, JsonType] = dict(twitch_data)
 
         if self._catalog is not None and len(fetched_data) < len(campaign_ids):
             missing_ids = campaign_ids.keys() - fetched_data.keys()
@@ -129,12 +133,49 @@ class InventoryService:
             filled_data = {
                 campaign["id"]: campaign
                 for campaign in catalog_campaigns
-                if campaign["id"] in missing_ids
+                if campaign.get("id") in missing_ids
             }
             fetched_data.update(filled_data)
             logger.info("Filled %d campaigns from public catalog", len(filled_data))
 
-        return GQLClient.merge_data(campaign_ids, fetched_data)
+        merged = self._merge_campaign_data(campaign_ids, fetched_data)
+
+        # Twitch's per-account state is authoritative. A fallback catalog has no
+        # such state, so its placeholder must never stand in where Twitch gave a
+        # real answer for the same campaign.
+        for campaign_id, twitch_campaign in twitch_data.items():
+            if campaign_id in merged and isinstance(twitch_campaign.get("self"), dict):
+                merged[campaign_id]["self"] = twitch_campaign["self"]
+
+        return merged
+
+    @staticmethod
+    def _merge_campaign_data(
+        campaign_ids: dict[str, JsonType], fetched_data: dict[str, JsonType]
+    ) -> dict[str, JsonType]:
+        """Combine the campaign list with the per-campaign details.
+
+        `GQLClient.merge_data` is strict: it raises when a key holds different
+        types in the two sources. That holds while both sides come from Twitch,
+        but the campaign list can come from a fallback catalog whose shape
+        differs, so a shape clash must not abort the whole inventory fetch.
+        Twitch's detail response is the authoritative, complete record for a
+        campaign it answered for, so prefer it in that case.
+        """
+        try:
+            return GQLClient.merge_data(campaign_ids, fetched_data)
+        except MinerException:
+            logger.warning(
+                "Campaign list and per-campaign details disagree in shape; "
+                "using the per-campaign details"
+            )
+            merged: dict[str, JsonType] = {
+                campaign_id: data
+                for campaign_id, data in campaign_ids.items()
+                if campaign_id not in fetched_data
+            }
+            merged.update(fetched_data)
+            return merged
 
     async def fetch_inventory(self) -> None:
         """
@@ -170,11 +211,15 @@ class InventoryService:
             available_list = await self._catalog.campaigns()
             logger.info("Twitch returned no campaigns; using public catalog (%d)", len(available_list))
         applicable_statuses = ("ACTIVE", "UPCOMING")
-        available_campaigns: dict[str, JsonType] = {
-            c["id"]: c
-            for c in available_list
-            if c["status"] in applicable_statuses  # that are currently not expired
-        }
+        available_campaigns: dict[str, JsonType] = {}
+        for record in available_list:
+            if not isinstance(record, dict):
+                continue
+            campaign_id = record.get("id")
+            # A campaign without an id or status cannot be tracked or filtered,
+            # so skip it rather than raising and losing the whole inventory.
+            if campaign_id and record.get("status") in applicable_statuses:
+                available_campaigns[campaign_id] = record
 
         # fetch detailed data for each campaign, in chunks
         status_update(_.t["gui"]["status"]["fetching_campaigns"])
